@@ -16,15 +16,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tracing::info;
 
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::buffer::{RAOP_PACKET_LEN, RaopBuffer, StreamFormat};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
-
-/// Sentinel value for [`RtpState::flush`] indicating no flush is pending.
-const NO_FLUSH: i32 = -42;
 
 /// RTP payload type for retransmit (RESEND) responses on the control channel.
 const CTRL_PAYLOAD_TYPE: u8 = 0x56;
@@ -74,18 +71,15 @@ pub(crate) fn remote_addr_bytes(remote: &str) -> Vec<u8> {
     }
 }
 
-/// Mutable state shared between the RTP receive loop and the RTSP handler thread.
-/// Updated via async message passing (tokio Mutex), consumed in the receive loop.
-struct RtpState {
-    /// Current volume in dB (0.0 = max, -144.0 = mute).
-    /// Set to true when volume changes; cleared after delivery.
-    /// Pending DMAP track metadata (binary).
-    /// Pending album artwork (JPEG/PNG).
-    /// DACP ID for remote control discovery.
-    /// Active-Remote token for DACP authentication.
-    /// Pending playback progress (start, current, end in RTP timestamps).
-    /// Sequence number to flush to, or [`NO_FLUSH`] if no flush pending.
-    flush: i32,
+/// Commands from the RTSP handler to the RTP receive task.
+///
+/// Delivered through a channel that has its own `select!` arm, so they are
+/// applied immediately — not only when the next RTP packet arrives. That
+/// matters for FLUSH on pause: the sender stops sending right after it.
+#[derive(Debug)]
+enum RtpCommand {
+    /// Drop buffered audio up to this sequence number (`-1` = everything).
+    Flush(i32),
 }
 
 /// Configuration for creating an AP1 RTP session, parsed from SDP.
@@ -132,8 +126,10 @@ pub(crate) struct RaopRtp {
     format: StreamFormat,
     /// Shared packet buffer (decrypt + decode on queue, dequeue in order).
     buffer: Arc<Mutex<RaopBuffer>>,
-    /// Shared mutable state for cross-task event delivery.
-    state: Arc<Mutex<RtpState>>,
+    /// Commands for the receive task (sender side).
+    cmd_tx: mpsc::UnboundedSender<RtpCommand>,
+    /// Receiver side, moved into the receive task by [`start`](Self::start).
+    cmd_rx: Option<mpsc::UnboundedReceiver<RtpCommand>>,
     /// Send `true` to shut down the receive task.
     shutdown_tx: Option<watch::Sender<bool>>,
     /// iPhone's control port (0 = no retransmits).
@@ -179,6 +175,7 @@ impl RaopRtp {
             None => RaopBuffer::new_unencrypted(&config.rtpmap, fmtp),
         }?;
         let format = buffer.format();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         Some(Self {
             handler: callbacks,
             remote: config.remote,
@@ -187,7 +184,8 @@ impl RaopRtp {
             remote_socket: config.remote_socket,
             format,
             buffer: Arc::new(Mutex::new(buffer)),
-            state: Arc::new(Mutex::new(RtpState { flush: NO_FLUSH })),
+            cmd_tx,
+            cmd_rx: Some(cmd_rx),
             shutdown_tx: None,
             control_rport: 0,
             control_lport: 0,
@@ -217,6 +215,15 @@ impl RaopRtp {
         info!(use_udp, control_rport, timing_rport, remote = %self.remote, "AP1 RTP starting");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
+        let cmd_rx = match self.cmd_rx.take() {
+            Some(rx) => rx,
+            // Restarted session: the previous task owns the old receiver.
+            None => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.cmd_tx = tx;
+                rx
+            }
+        };
 
         if use_udp {
             let bind_addr = SocketAddr::new(rtp_bind_addr(self.local_addr), 0);
@@ -252,27 +259,23 @@ impl RaopRtp {
             );
 
             let buffer = self.buffer.clone();
-            let state = self.state.clone();
             // If control_rport is 0, the iPhone doesn't support retransmits.
             let no_resend = control_rport == 0;
             let _remote_for_task = self.remote.clone();
 
             tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_rx;
+                let mut cmd_rx = cmd_rx;
                 let mut data_packet = [0u8; RAOP_PACKET_LEN];
                 let mut ctrl_packet = [0u8; RAOP_PACKET_LEN];
                 loop {
-                    // Drain flush events only — metadata goes through AudioHandler now.
-                    {
-                        let mut st = state.lock().await;
-                        if st.flush != NO_FLUSH {
-                            buffer.lock().await.flush(st.flush);
-                            session.audio_flush();
-                            st.flush = NO_FLUSH;
-                        }
-                    }
-
                     tokio::select! {
+                        Some(cmd) = cmd_rx.recv() => match cmd {
+                            RtpCommand::Flush(seq) => {
+                                buffer.lock().await.flush(seq);
+                                session.audio_flush();
+                            }
+                        },
                         // Data channel: audio RTP packets.
                         result = dsock.recv_from(&mut data_packet) => {
                             if let Ok((len, _)) = result
@@ -329,12 +332,12 @@ impl RaopRtp {
             );
 
             let buffer = self.buffer.clone();
-            let state = self.state.clone();
             let _remote_for_tcp = self.remote.clone();
 
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut shutdown_rx = shutdown_rx;
+                let mut cmd_rx = cmd_rx;
 
                 // Wait for the iPhone to connect.
                 let stream = tokio::select! {
@@ -350,17 +353,13 @@ impl RaopRtp {
                 let mut read_buf = [0u8; 4096];
 
                 'tcp: loop {
-                    // Drain flush events only — metadata goes through AudioHandler now.
-                    {
-                        let mut st = state.lock().await;
-                        if st.flush != NO_FLUSH {
-                            buffer.lock().await.flush(st.flush);
-                            session.audio_flush();
-                            st.flush = NO_FLUSH;
-                        }
-                    }
-
                     tokio::select! {
+                        Some(cmd) = cmd_rx.recv() => match cmd {
+                            RtpCommand::Flush(seq) => {
+                                buffer.lock().await.flush(seq);
+                                session.audio_flush();
+                            }
+                        },
                         result = reader.read(&mut read_buf) => {
                             match result {
                                 Ok(0) | Err(_) => break,
@@ -413,10 +412,8 @@ impl RaopRtp {
 
     /// Request a buffer flush up to the given sequence number.
     pub(crate) fn flush(&self, next_seq: i32) {
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            state.lock().await.flush = next_seq;
-        });
+        // Fails only if the receive task has ended; nothing left to flush then.
+        let _ = self.cmd_tx.send(RtpCommand::Flush(next_seq));
     }
 
     /// Stop the receive task and flush the buffer.
