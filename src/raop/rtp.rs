@@ -147,6 +147,30 @@ fn make_resampler(
     }
 }
 
+/// Whether a resampler was actually built (always `false` without the
+/// `resample` feature, where `output_sample_rate` cannot be honoured).
+#[cfg(feature = "resample")]
+macro_rules! resampling_active {
+    ($resampler:ident) => {
+        $resampler.is_some()
+    };
+}
+#[cfg(not(feature = "resample"))]
+macro_rules! resampling_active {
+    ($resampler:ident) => {
+        false
+    };
+}
+
+/// Sample rate of the PCM actually delivered to the [`AudioSession`]: the
+/// requested output rate only if a resampler is running, else the source rate.
+fn delivered_sample_rate(source: u32, requested: Option<u32>, resampling: bool) -> u32 {
+    match requested {
+        Some(rate) if resampling => rate,
+        _ => source,
+    }
+}
+
 impl RaopRtp {
     /// Create a new RTP session from SDP parameters and AES session keys.
     /// Does not bind sockets or start receiving — call [`start`](Self::start) for that.
@@ -227,22 +251,22 @@ impl RaopRtp {
             super::ntp::spawn_ntp_responder(tsock, timing_addr);
 
             let format = self.format;
-            let mut session = self.handler.audio_init(AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: 32,
-                channels: format.num_channels,
-                // When resampling is enabled the audio delivered downstream is at
-                // the output rate, so announce that (matching the non-UDP path);
-                // fall back to the stream's native rate when not resampling.
-                sample_rate: self.output_sample_rate.unwrap_or(format.sample_rate),
-            });
-
             #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
                 self.output_sample_rate,
                 format.sample_rate,
                 format.num_channels as usize,
             );
+            let mut session = self.handler.audio_init(AudioFormat {
+                codec: AudioCodec::Pcm,
+                bits: 32,
+                channels: format.num_channels,
+                sample_rate: delivered_sample_rate(
+                    format.sample_rate,
+                    self.output_sample_rate,
+                    resampling_active!(resampler),
+                ),
+            });
 
             let buffer = self.buffer.clone();
             // If control_rport is 0, the iPhone doesn't support retransmits.
@@ -303,19 +327,22 @@ impl RaopRtp {
             self.data_lport = listener.local_addr().map_err(NetworkError::Io)?.port();
 
             let format = self.format;
-            let mut session = self.handler.audio_init(AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: 32,
-                channels: format.num_channels,
-                sample_rate: self.output_sample_rate.unwrap_or(format.sample_rate),
-            });
-
             #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
                 self.output_sample_rate,
                 format.sample_rate,
                 format.num_channels as usize,
             );
+            let mut session = self.handler.audio_init(AudioFormat {
+                codec: AudioCodec::Pcm,
+                bits: 32,
+                channels: format.num_channels,
+                sample_rate: delivered_sample_rate(
+                    format.sample_rate,
+                    self.output_sample_rate,
+                    resampling_active!(resampler),
+                ),
+            });
 
             let buffer = self.buffer.clone();
             let _remote_for_tcp = self.remote.clone();
@@ -408,5 +435,18 @@ impl RaopRtp {
             let _ = tx.send(true);
         }
         self.flush(-1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delivered_sample_rate;
+
+    #[test]
+    fn announces_output_rate_only_when_resampling() {
+        assert_eq!(delivered_sample_rate(44_100, Some(48_000), true), 48_000);
+        assert_eq!(delivered_sample_rate(44_100, Some(48_000), false), 44_100);
+        assert_eq!(delivered_sample_rate(44_100, None, false), 44_100);
+        assert_eq!(delivered_sample_rate(44_100, None, true), 44_100);
     }
 }
