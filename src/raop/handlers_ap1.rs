@@ -342,13 +342,32 @@ pub(crate) fn handle_setup(
     if let (Some(dacp_id), Some(active_remote)) =
         (request.header("DACP-ID"), request.header("Active-Remote"))
     {
-        let addr_bytes = crate::raop::rtp::remote_addr_bytes(&conn.remote_socket.ip().to_string());
-        let remote = std::sync::Arc::new(crate::raop::DacpRemoteControl::new(
-            dacp_id,
-            active_remote,
-            &addr_bytes,
-        ));
-        conn.shared.handler.on_remote_control(remote);
+        let info = crate::raop::DacpInfo {
+            dacp_id: dacp_id.to_owned(),
+            active_remote: active_remote.to_owned(),
+            peer: conn.remote_socket,
+            user_agent: request.header("User-Agent").map(str::to_owned),
+        };
+        conn.shared.handler.on_dacp_info(&info);
+
+        // The mDNS lookup blocks for up to 2 s; never do it on the RTSP path,
+        // or the SETUP response (and audio start) is delayed by that much.
+        if conn.shared.dacp_discovery {
+            let handler = conn.shared.handler.clone();
+            let spawned = std::thread::Builder::new()
+                .name("dacp-discovery".into())
+                .spawn(move || {
+                    let remote = crate::raop::DacpRemoteControl::new(
+                        &info.dacp_id,
+                        &info.active_remote,
+                        info.peer,
+                    );
+                    handler.on_remote_control(std::sync::Arc::new(remote));
+                });
+            if let Err(error) = spawned {
+                tracing::warn!(%error, "could not spawn DACP discovery thread");
+            }
+        }
     }
 
     let use_udp = !transport.starts_with("RTP/AVP/TCP");
@@ -505,6 +524,7 @@ mod tests {
             handler,
             output_sample_rate: None,
             output_max_channels: None,
+            dacp_discovery: true,
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {

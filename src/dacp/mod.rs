@@ -74,7 +74,7 @@ fn discover_dacp_port(dacp_id: &str, _remote_ip: std::net::IpAddr) -> Option<u16
 /// # Example
 /// ```text
 /// let mut client = DacpClient::new("7711DA8B47838CB5", "1986535575");
-/// client.discover_from_remote("192.168.1.5".parse().unwrap());
+/// client.discover_from_remote("192.168.1.5:7000".parse().unwrap());
 /// // Then from a synchronous remote-control callback:
 /// // client.play_pause_blocking().ok();
 /// ```
@@ -102,17 +102,21 @@ impl DacpClient {
     /// Browses `_dacp._tcp.local.` for a service matching the DACP-ID,
     /// with a 2-second timeout. Falls back to port 3689 on the remote IP
     /// if mDNS discovery fails.
-    pub(crate) fn discover_from_remote(&mut self, remote_ip: std::net::IpAddr) {
-        self.addr = match discover_dacp_port(&self.dacp_id, remote_ip) {
+    ///
+    /// Takes the full peer address so a link-local IPv6 scope id survives.
+    pub(crate) fn discover_from_remote(&mut self, peer: SocketAddr) {
+        let mut addr = peer;
+        match discover_dacp_port(&self.dacp_id, peer.ip()) {
             Some(port) => {
                 debug!(port, dacp_id = %self.dacp_id, "DACP service discovered via mDNS");
-                Some(SocketAddr::new(remote_ip, port))
+                addr.set_port(port);
             }
             None => {
                 debug!(dacp_id = %self.dacp_id, "DACP mDNS discovery failed, falling back to port 3689");
-                Some(SocketAddr::new(remote_ip, DACP_DEFAULT_PORT))
+                addr.set_port(DACP_DEFAULT_PORT);
             }
-        };
+        }
+        self.addr = Some(addr);
     }
 
     /// Send a raw DACP command from synchronous callbacks.

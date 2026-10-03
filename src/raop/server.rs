@@ -77,6 +77,7 @@ pub struct RaopServerBuilder {
     mode: AirPlayMode,
     output_sample_rate: Option<u32>,
     output_max_channels: Option<u8>,
+    dacp_discovery: bool,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
     #[cfg(feature = "ap2")]
@@ -112,6 +113,7 @@ impl RaopServerBuilder {
             mode: AirPlayMode::default(),
             output_sample_rate: None,
             output_max_channels: None,
+            dacp_discovery: true,
             ap1_codecs: None,
             ap1_encryption: None,
             #[cfg(feature = "ap2")]
@@ -161,6 +163,17 @@ impl RaopServerBuilder {
     /// Set full bind configuration (address, port, auto-sensing, IPv6).
     pub fn bind(mut self, config: BindConfig) -> Self {
         self.bind = config;
+        self
+    }
+    /// Enable the built-in DACP discovery (default: `true`).
+    ///
+    /// When enabled, an AP1 SETUP carrying `DACP-ID`/`Active-Remote` starts a
+    /// background `_dacp._tcp` lookup and then calls
+    /// [`AudioHandler::on_remote_control`]. Disable it when the application
+    /// runs its own DACP client from [`AudioHandler::on_dacp_info`], which is
+    /// called either way.
+    pub fn dacp_discovery(mut self, enabled: bool) -> Self {
+        self.dacp_discovery = enabled;
         self
     }
     /// Set the AirPlay display name. Default: "Shairplay".
@@ -342,6 +355,7 @@ impl RaopServerBuilder {
             identity_seed,
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
+            dacp_discovery: self.dacp_discovery,
             #[cfg(feature = "ap2")]
             pin: self.pin,
             #[cfg(feature = "video")]

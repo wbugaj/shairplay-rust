@@ -113,7 +113,16 @@ pub trait AudioHandler: Send + Sync + 'static {
     /// Playback progress (start, current, end in RTP timestamps at 44100 Hz).
     fn on_progress(&self, _start: u32, _current: u32, _end: u32) {}
     /// A remote control interface is available (AP1 DACP).
+    ///
+    /// With DACP discovery enabled (the default, see
+    /// [`RaopServerBuilder::dacp_discovery`](crate::RaopServerBuilder::dacp_discovery))
+    /// this is called from a background thread once the sender's `_dacp._tcp`
+    /// service has been looked up (up to ~2 s after SETUP).
     fn on_remote_control(&self, _remote: Arc<dyn RemoteControl>) {}
+    /// The sender offered DACP remote control (AP1 `SETUP` carried `DACP-ID`
+    /// and `Active-Remote`). Called inline and cheaply, before any discovery,
+    /// so applications can run their own DACP client.
+    fn on_dacp_info(&self, _info: &DacpInfo) {}
 
     // --- Connection lifecycle ---
 
@@ -214,6 +223,20 @@ pub trait AudioSession: Send + Sync {
     fn audio_process(&mut self, samples: &[f32]);
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
+}
+
+/// DACP parameters of an AP1 sender, passed to [`AudioHandler::on_dacp_info`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DacpInfo {
+    /// `DACP-ID` header; the sender advertises `iTunes_Ctrl_<DACP-ID>._dacp._tcp`.
+    pub dacp_id: String,
+    /// `Active-Remote` header; must be sent back with every DACP request.
+    pub active_remote: String,
+    /// RTSP peer address (keeps the IPv6 scope id for link-local peers).
+    pub peer: std::net::SocketAddr,
+    /// `User-Agent` header, if present (e.g. `AirPlay/960.13.1`).
+    pub user_agent: Option<String>,
 }
 
 /// Playback command to send to the source device.
