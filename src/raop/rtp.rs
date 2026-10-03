@@ -162,6 +162,80 @@ macro_rules! resampling_active {
     };
 }
 
+/// AP1 SYNC packet (control port, payload type 0x54).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncPacket {
+    /// Extension bit: first SYNC after RECORD/FLUSH.
+    first: bool,
+    /// RTP timestamp that is audible at `ntp` ("now minus latency").
+    rtp_now_minus_latency: u32,
+    /// Sender clock "now" (NTP).
+    ntp: super::ntp::NtpTime,
+    /// RTP timestamp the sender is sending "now".
+    rtp_now: u32,
+}
+
+/// Parses a SYNC packet: `[0]` 0x80 (0x90 = first), `[1]` 0xd4, `[2..4]` seq,
+/// `[4..8]` RTP now−latency, `[8..16]` NTP now, `[16..20]` RTP now.
+fn parse_sync(p: &[u8]) -> Option<SyncPacket> {
+    if p.len() < 20 || p[1] & 0x7f != 0x54 {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_be_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+    let mut ntp = [0u8; 8];
+    ntp.copy_from_slice(&p[8..16]);
+    Some(SyncPacket {
+        first: p[0] & 0x10 != 0,
+        rtp_now_minus_latency: u32_at(4),
+        ntp: u64::from_be_bytes(ntp),
+        rtp_now: u32_at(16),
+    })
+}
+
+/// Maps a SYNC packet onto the local clock. `arrival` is the local
+/// `(Instant, NTP)` pair taken when the packet was received.
+fn anchor_from_sync(
+    sync: &SyncPacket,
+    arrival: (std::time::Instant, super::ntp::NtpTime),
+    clock: Option<super::ntp::ClockEstimate>,
+) -> crate::raop::PlayoutAnchor {
+    use crate::raop::ClockSource;
+    use std::time::Duration;
+
+    let (arrival_instant, arrival_ntp) = arrival;
+    let (play_at, source) = match clock {
+        Some(est) => {
+            // Local time of the sender's "now" = sender time − offset.
+            let local_ns = super::ntp::ntp_diff_ns(sync.ntp, arrival_ntp) - est.offset_ns;
+            let delta =
+                Duration::from_nanos(local_ns.unsigned_abs().min(u128::from(u64::MAX)) as u64);
+            let play_at = if local_ns >= 0 {
+                arrival_instant + delta
+            } else {
+                arrival_instant
+                    .checked_sub(delta)
+                    .unwrap_or(arrival_instant)
+            };
+            let source = ClockSource::Ntp {
+                offset: Duration::from_nanos(
+                    est.offset_ns.unsigned_abs().min(u128::from(u64::MAX)) as u64,
+                ),
+                sender_behind: est.offset_ns < 0,
+                rtt: Duration::from_nanos(est.rtt_ns.max(0) as u64),
+            };
+            (play_at, source)
+        }
+        None => (arrival_instant, ClockSource::Arrival),
+    };
+    crate::raop::PlayoutAnchor {
+        rtp_ts: sync.rtp_now_minus_latency,
+        play_at,
+        latency_frames: sync.rtp_now.wrapping_sub(sync.rtp_now_minus_latency),
+        first: sync.first,
+        clock: source,
+    }
+}
+
 /// Sample rate of the PCM actually delivered to the [`AudioSession`]: the
 /// requested output rate only if a resampler is running, else the source rate.
 fn delivered_sample_rate(source: u32, requested: Option<u32>, resampling: bool) -> u32 {
@@ -248,7 +322,13 @@ impl RaopRtp {
             let remote_sockaddr = self.remote_socket;
             let mut timing_addr = remote_sockaddr;
             timing_addr.set_port(timing_rport);
-            super::ntp::spawn_ntp_responder(tsock, timing_addr);
+            let (clock_tx, clock_rx) = watch::channel(None);
+            super::ntp::spawn_ntp_responder(
+                tsock,
+                timing_addr,
+                clock_tx,
+                Some(shutdown_rx.clone()),
+            );
 
             let format = self.format;
             #[cfg(feature = "resample")]
@@ -292,24 +372,32 @@ impl RaopRtp {
                                 && len >= 12 {
                                     let mut buf = buffer.lock().await;
                                     buf.queue(&data_packet[..len], true);
-                                    while let Some(samples) = buf.dequeue(no_resend) {
+                                    while let Some((samples, timing)) = buf.dequeue_timed(no_resend) {
                                         {
                                             #[cfg(feature = "resample")]
                                             if let Some(ref mut rs) = resampler {
                                                 let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
+                                                session.audio_process_timed(&resampled, timing);
                                             } else {
-                                                session.audio_process(samples);
+                                                session.audio_process_timed(samples, timing);
                                             }
                                             #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
+                                            session.audio_process_timed(samples, timing);
                                         }
                                     }
                                 }
                         }
-                        // Control channel: retransmit responses (payload type 0x56).
+                        // Control channel: SYNC (0x54) and retransmit responses (0x56).
                         result = csock.recv_from(&mut ctrl_packet) => {
+                            let arrival = (std::time::Instant::now(), super::ntp::ntp_now());
                             if let Ok((len, _)) = result
+                                && let Some(sync) = parse_sync(&ctrl_packet[..len])
+                            {
+                                let clock = *clock_rx.borrow();
+                                let anchor = anchor_from_sync(&sync, arrival, clock);
+                                tracing::trace!(?anchor, "AP1 SYNC");
+                                session.on_playout_anchor(anchor);
+                            } else if let Ok((len, _)) = result
                                 && len >= 12 && (ctrl_packet[1] & !0x80) == CTRL_PAYLOAD_TYPE {
                                     let mut buf = buffer.lock().await;
                                     // Retransmit packets have a 4-byte header before the original RTP.
@@ -397,17 +485,17 @@ impl RaopRtp {
                                 if packet_buf.len() < 4 + rtp_len { break; }
                                 let mut buf = buffer.lock().await;
                                 buf.queue(&packet_buf[4..4 + rtp_len], false);
-                                if let Some(samples) = buf.dequeue(true) {
+                                if let Some((samples, timing)) = buf.dequeue_timed(true) {
                                     {
                                             #[cfg(feature = "resample")]
                                             if let Some(ref mut rs) = resampler {
                                                 let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
+                                                session.audio_process_timed(&resampled, timing);
                                             } else {
-                                                session.audio_process(samples);
+                                                session.audio_process_timed(samples, timing);
                                             }
                                             #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
+                                            session.audio_process_timed(samples, timing);
                                         }
                                 }
                                 drop(buf);
@@ -448,5 +536,75 @@ mod tests {
         assert_eq!(delivered_sample_rate(44_100, Some(48_000), false), 44_100);
         assert_eq!(delivered_sample_rate(44_100, None, false), 44_100);
         assert_eq!(delivered_sample_rate(44_100, None, true), 44_100);
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::{anchor_from_sync, parse_sync};
+    use crate::raop::ClockSource;
+    use crate::raop::ntp::ClockEstimate;
+    use std::time::{Duration, Instant};
+
+    const SEC: u64 = 1 << 32;
+
+    fn sync_packet(first: bool, rtp_minus_latency: u32, ntp: u64, rtp_now: u32) -> Vec<u8> {
+        let mut p = vec![if first { 0x90 } else { 0x80 }, 0xd4, 0x00, 0x07];
+        p.extend_from_slice(&rtp_minus_latency.to_be_bytes());
+        p.extend_from_slice(&ntp.to_be_bytes());
+        p.extend_from_slice(&rtp_now.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn parses_sync_and_rejects_others() {
+        let s = parse_sync(&sync_packet(true, 1000, 7 * SEC, 89_200)).unwrap();
+        assert!(s.first);
+        assert_eq!(
+            (s.rtp_now_minus_latency, s.ntp, s.rtp_now),
+            (1000, 7 * SEC, 89_200)
+        );
+        let mut resend = sync_packet(false, 0, 0, 0);
+        resend[1] = 0xd6;
+        assert!(parse_sync(&resend).is_none());
+        assert!(parse_sync(&sync_packet(false, 0, 0, 0)[..19]).is_none());
+    }
+
+    #[test]
+    fn anchor_without_ntp_uses_arrival() {
+        let s = parse_sync(&sync_packet(false, 1000, 7 * SEC, 89_200)).unwrap();
+        let now = Instant::now();
+        let a = anchor_from_sync(&s, (now, 100 * SEC), None);
+        assert_eq!(a.play_at, now);
+        assert_eq!(a.rtp_ts, 1000);
+        assert_eq!(a.latency_frames, 88_200);
+        assert_eq!(a.clock, ClockSource::Arrival);
+    }
+
+    #[test]
+    fn anchor_with_ntp_maps_sender_time() {
+        // Sender clock is 50 s ahead of ours. Its SYNC says "now" = 150.25 s
+        // sender time = 100.25 s local; it arrives at local 100.2 s, so the
+        // anchor is 50 ms after arrival.
+        let s = parse_sync(&sync_packet(false, 1000, 150 * SEC + SEC / 4, 89_200)).unwrap();
+        let est = ClockEstimate {
+            offset_ns: 50_000_000_000,
+            rtt_ns: 3_000_000,
+        };
+        let now = Instant::now();
+        let arrival_ntp = 100 * SEC + SEC / 5;
+        let a = anchor_from_sync(&s, (now, arrival_ntp), Some(est));
+        let delta = a.play_at - now;
+        assert!(
+            delta.abs_diff(Duration::from_millis(50)) < Duration::from_micros(1),
+            "{delta:?}"
+        );
+        assert!(matches!(
+            a.clock,
+            ClockSource::Ntp {
+                sender_behind: false,
+                ..
+            }
+        ));
     }
 }

@@ -223,6 +223,65 @@ pub trait AudioSession: Send + Sync {
     fn audio_process(&mut self, samples: &[f32]);
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
+    /// Like [`audio_process`](Self::audio_process), plus the RTP timing of
+    /// the packet. Implement this to schedule playout by timestamp (AP1).
+    ///
+    /// The default forwards to `audio_process`. When the server resamples
+    /// (`output_sample_rate`), `timing` still describes the *source* packet.
+    fn audio_process_timed(&mut self, samples: &[f32], timing: FrameTiming) {
+        let _ = timing;
+        self.audio_process(samples);
+    }
+    /// A sender SYNC packet mapped the RTP timeline onto the local clock (AP1,
+    /// about once per second while streaming).
+    fn on_playout_anchor(&mut self, _anchor: PlayoutAnchor) {}
+}
+
+/// RTP timing of one decoded packet, passed to [`AudioSession::audio_process_timed`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTiming {
+    /// RTP timestamp of the first frame, in source sample-rate units.
+    pub rtp_ts: u32,
+    /// RTP sequence number.
+    pub seq: u16,
+    /// The packet was lost and replaced by silence; `rtp_ts` is extrapolated.
+    pub silence: bool,
+}
+
+/// How a sender time was mapped onto the local clock.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockSource {
+    /// NTP exchange with the sender (offset and round trip of the best sample).
+    Ntp {
+        /// `sender_clock - local_clock`.
+        offset: std::time::Duration,
+        /// Whether the sender clock is behind ours (offset is negative).
+        sender_behind: bool,
+        /// Round trip of the sample the offset came from.
+        rtt: std::time::Duration,
+    },
+    /// No NTP estimate yet: the SYNC packet's arrival time stands in for the
+    /// sender's "now" (off by the one-way network delay).
+    Arrival,
+}
+
+/// "Frame `rtp_ts` must be audible at `play_at`": one AP1 SYNC packet mapped
+/// onto the local clock. Passed to [`AudioSession::on_playout_anchor`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayoutAnchor {
+    /// RTP timestamp (source sample-rate units).
+    pub rtp_ts: u32,
+    /// Local time at which `rtp_ts` should be heard.
+    pub play_at: std::time::Instant,
+    /// Sender-requested latency in frames (e.g. 88200 = 2 s at 44.1 kHz).
+    pub latency_frames: u32,
+    /// First SYNC after RECORD or FLUSH (RTP extension bit set).
+    pub first: bool,
+    /// How the sender's clock was mapped.
+    pub clock: ClockSource,
 }
 
 /// DACP parameters of an AP1 sender, passed to [`AudioHandler::on_dacp_info`].

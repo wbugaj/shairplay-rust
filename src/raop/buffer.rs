@@ -10,6 +10,8 @@ use crate::codec::alac::{AlacConfig, AlacDecoder};
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use std::borrow::Cow;
 
+use crate::raop::FrameTiming;
+
 /// AES-128 key length in bytes.
 pub const RAOP_AESKEY_LEN: usize = 16;
 /// AES-128 IV length in bytes.
@@ -210,6 +212,9 @@ pub struct RaopBuffer {
     /// Number of f32 samples to emit when substituting silence for a lost frame.
     /// Constant for ALAC (fixed frame size); tracks the last real frame for PCM.
     silence_samples: usize,
+    /// RTP timestamp expected for the next dequeued frame; used to time a
+    /// silence substitute for a lost packet.
+    next_timestamp: Option<u32>,
 }
 
 impl RaopBuffer {
@@ -288,6 +293,7 @@ impl RaopBuffer {
             entries,
             frame_capacity,
             silence_samples,
+            next_timestamp: None,
         })
     }
 
@@ -442,6 +448,14 @@ impl RaopBuffer {
     /// to allow time for a retransmit. If `no_resend` is true (or the buffer
     /// is full), substitutes silence for the missing frame.
     pub fn dequeue(&mut self, no_resend: bool) -> Option<&[f32]> {
+        self.dequeue_timed(no_resend).map(|(samples, _)| samples)
+    }
+
+    /// Like [`dequeue`](Self::dequeue), plus the frame's RTP timing.
+    ///
+    /// A silence substitute for a lost frame gets the timestamp that frame
+    /// would have had (previous timestamp + previous frame length).
+    pub fn dequeue_timed(&mut self, no_resend: bool) -> Option<(&[f32], FrameTiming)> {
         let buflen = seqnum_cmp(self.last_seqnum, self.first_seqnum) as i32 + 1;
         if self.is_empty || buflen <= 0 {
             return None;
@@ -453,18 +467,33 @@ impl RaopBuffer {
             return None;
         }
 
+        let seq = self.first_seqnum;
         self.first_seqnum = self.first_seqnum.wrapping_add(1);
 
         // Substitute silence for missing frames.
-        if !self.entries[idx].available {
+        let silence = !self.entries[idx].available;
+        if silence {
             let size = self.silence_samples.min(self.frame_capacity);
             self.entries[idx].audio_buffer[..size].fill(0.0);
             self.entries[idx].audio_buffer_len = size;
         }
-        self.entries[idx].available = false;
         let len = self.entries[idx].audio_buffer_len;
+        let rtp_ts = if silence {
+            self.next_timestamp.unwrap_or(0)
+        } else {
+            self.entries[idx].timestamp
+        };
+        let channels = usize::from(self.format().num_channels.max(1));
+        self.next_timestamp = Some(rtp_ts.wrapping_add((len / channels) as u32));
+
+        self.entries[idx].available = false;
         self.entries[idx].audio_buffer_len = 0;
-        Some(&self.entries[idx].audio_buffer[..len])
+        let timing = FrameTiming {
+            rtp_ts,
+            seq,
+            silence,
+        };
+        Some((&self.entries[idx].audio_buffer[..len], timing))
     }
 
     /// Flush the buffer, discarding all queued frames.
@@ -472,6 +501,7 @@ impl RaopBuffer {
     /// If `next_seq` is a valid 16-bit value (0..=0xFFFF), the buffer resets
     /// to expect that sequence number next. Otherwise the buffer is fully emptied.
     pub fn flush(&mut self, next_seq: i32) {
+        self.next_timestamp = None;
         for entry in &mut self.entries {
             entry.available = false;
             entry.audio_buffer_len = 0;

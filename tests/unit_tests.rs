@@ -866,3 +866,43 @@ fn server_build_generates_and_persists_random_identity() {
         "build() should generate and persist an identity seed when the store has none"
     );
 }
+
+// ============================================================
+// RTP Buffer — timed dequeue (fork: scheduled playout)
+// ============================================================
+fn l16_packet(seq: u16, ts: u32, frames: usize) -> Vec<u8> {
+    let mut p = vec![0x80, 0x60];
+    p.extend_from_slice(&seq.to_be_bytes());
+    p.extend_from_slice(&ts.to_be_bytes());
+    p.extend_from_slice(&[0, 0, 0, 1]);
+    p.extend(std::iter::repeat_n(0u8, frames * 4));
+    p
+}
+
+#[test]
+fn rtp_buffer_dequeue_timed_reports_timestamps() {
+    let mut buf = RaopBuffer::new_unencrypted("96 L16/44100/2", "").expect("L16");
+    assert_eq!(buf.queue(&l16_packet(10, 1000, 352), true), 1);
+    assert_eq!(buf.queue(&l16_packet(11, 1352, 352), true), 1);
+    let (samples, t) = buf.dequeue_timed(true).unwrap();
+    assert_eq!(samples.len(), 704);
+    assert_eq!((t.rtp_ts, t.seq, t.silence), (1000, 10, false));
+    let (_, t) = buf.dequeue_timed(true).unwrap();
+    assert_eq!((t.rtp_ts, t.seq, t.silence), (1352, 11, false));
+}
+
+#[test]
+fn rtp_buffer_lost_packet_gets_extrapolated_timestamp() {
+    let mut buf = RaopBuffer::new_unencrypted("96 L16/44100/2", "").expect("L16");
+    buf.queue(&l16_packet(1, 5000, 352), true);
+    // seq 2 is lost
+    buf.queue(&l16_packet(3, 5704, 352), true);
+    let (_, t1) = buf.dequeue_timed(true).unwrap();
+    let (silence, t2) = buf.dequeue_timed(true).unwrap();
+    assert!(silence.iter().all(|s| *s == 0.0));
+    let (_, t3) = buf.dequeue_timed(true).unwrap();
+    assert_eq!(t1.rtp_ts, 5000);
+    assert!(t2.silence);
+    assert_eq!((t2.seq, t2.rtp_ts), (2, 5352));
+    assert_eq!((t3.rtp_ts, t3.silence), (5704, false));
+}
