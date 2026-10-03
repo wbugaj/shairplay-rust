@@ -206,6 +206,13 @@ pub(crate) fn handle_announce(
     let remote = sdp.connection()?;
     let rtpmap = sdp.rtpmap()?;
     let fmtp = sdp.fmtp();
+    // The sender's latency bounds (frames), if it sends them. Logged so a
+    // receiver can see what range its `Audio-Latency` must fall in.
+    tracing::info!(
+        min_latency = sdp.min_latency().unwrap_or("-"),
+        max_latency = sdp.max_latency().unwrap_or("-"),
+        "ANNOUNCE latency hints"
+    );
     // aesiv/rsaaeskey are absent when the sender negotiated no encryption
     // (e.g. PipeWire's et=0 mode).
     let rsa_key = sdp.rsaaeskey();

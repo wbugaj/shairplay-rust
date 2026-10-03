@@ -10,6 +10,7 @@ pub struct Sdp {
     fpaeskey: Option<String>,
     aesiv: Option<String>,
     min_latency: Option<String>,
+    max_latency: Option<String>,
 }
 
 impl Sdp {
@@ -24,6 +25,7 @@ impl Sdp {
             fpaeskey: None,
             aesiv: None,
             min_latency: None,
+            max_latency: None,
         };
 
         for line in data.lines() {
@@ -50,6 +52,7 @@ impl Sdp {
                             "fpaeskey" => sdp.fpaeskey = Some(val.to_string()),
                             "aesiv" => sdp.aesiv = Some(val.to_string()),
                             "min-latency" => sdp.min_latency = Some(val.to_string()),
+                            "max-latency" => sdp.max_latency = Some(val.to_string()),
                             _ => {}
                         }
                     }
@@ -92,5 +95,24 @@ impl Sdp {
     /// Minimum latency (a=min-latency).
     pub fn min_latency(&self) -> Option<&str> {
         self.min_latency.as_deref()
+    }
+    /// Maximum latency (a=max-latency).
+    pub fn max_latency(&self) -> Option<&str> {
+        self.max_latency.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sdp;
+
+    #[test]
+    fn parses_latency_bounds() {
+        let sdp = Sdp::parse(
+            "v=0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=min-latency:11025\r\na=max-latency:88200\r\n",
+        );
+        assert_eq!(sdp.min_latency(), Some("11025"));
+        assert_eq!(sdp.max_latency(), Some("88200"));
+        assert_eq!(Sdp::parse("v=0\r\n").max_latency(), None);
     }
 }
