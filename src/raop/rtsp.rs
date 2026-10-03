@@ -349,14 +349,77 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     Some(handlers::handle_record)
 }
 
+/// Values of an RTSP `RTP-Info` header, e.g. `seq=12345;rtptime=67890`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RtpInfo {
+    pub(crate) seq: Option<u16>,
+    pub(crate) rtptime: Option<u32>,
+}
+
+/// Parses `RTP-Info`. Senders send `seq=…;rtptime=…` (order not guaranteed);
+/// unknown or malformed parameters are ignored.
+pub(crate) fn parse_rtp_info(value: &str) -> RtpInfo {
+    let mut info = RtpInfo::default();
+    for param in value.split(';') {
+        let Some((key, val)) = param.trim().split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "seq" => info.seq = val.trim().parse().ok(),
+            "rtptime" => info.rtptime = val.trim().parse().ok(),
+            _ => {}
+        }
+    }
+    info
+}
+
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
+///
+/// A FLUSH without a usable `seq` still flushes everything: the sender has
+/// stopped (pause/seek) and anything buffered is stale.
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
-    if let Some(rtp_info) = request.header("RTP-Info")
-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
-        && let Ok(next_seq) = seq_str.parse::<i32>()
-        && let Some(rtp) = &conn.raop_rtp
-    {
-        rtp.flush(next_seq);
+    let info = request
+        .header("RTP-Info")
+        .map(parse_rtp_info)
+        .unwrap_or_default();
+    tracing::debug!(seq = ?info.seq, rtptime = ?info.rtptime, "AP1 FLUSH");
+    if let Some(rtp) = &conn.raop_rtp {
+        rtp.flush(info.seq.map_or(-1, i32::from));
+    }
+}
+
+#[cfg(test)]
+mod rtp_info_tests {
+    use super::{RtpInfo, parse_rtp_info};
+
+    #[test]
+    fn parses_seq_and_rtptime() {
+        assert_eq!(
+            parse_rtp_info("seq=12345;rtptime=3735928559"),
+            RtpInfo {
+                seq: Some(12345),
+                rtptime: Some(3_735_928_559)
+            }
+        );
+    }
+
+    #[test]
+    fn order_and_whitespace_do_not_matter() {
+        assert_eq!(
+            parse_rtp_info(" rtptime=7 ; seq=8 "),
+            RtpInfo {
+                seq: Some(8),
+                rtptime: Some(7)
+            }
+        );
+    }
+
+    #[test]
+    fn seq_only_and_garbage() {
+        assert_eq!(parse_rtp_info("seq=1").seq, Some(1));
+        assert_eq!(parse_rtp_info("seq=70000"), RtpInfo::default());
+        assert_eq!(parse_rtp_info("nonsense"), RtpInfo::default());
+        assert_eq!(parse_rtp_info(""), RtpInfo::default());
     }
 }
 
