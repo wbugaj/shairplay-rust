@@ -411,14 +411,14 @@ pub(crate) fn handle_setup(
 
 /// AP1 RTSP RECORD: acknowledge the start of RTP streaming.
 pub(crate) fn handle_record(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    // Mirror the AP2 RECORD response: classic RAOP clients expect an
-    // Audio-Latency header. The value is a placeholder — actual playback
-    // timing is handled by the RTP layer, not advertised here.
-    response.add_header("Audio-Latency", "0");
+    // Classic RAOP clients expect an Audio-Latency header (in frames). It
+    // defaults to 0; applications that schedule playout themselves report
+    // their real output latency via `RaopServerBuilder::audio_latency`.
+    response.add_header("Audio-Latency", &conn.shared.audio_latency.to_string());
     None
 }
 
@@ -525,6 +525,7 @@ mod tests {
             output_sample_rate: None,
             output_max_channels: None,
             dacp_discovery: true,
+            audio_latency: 0,
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {

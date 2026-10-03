@@ -78,6 +78,7 @@ pub struct RaopServerBuilder {
     output_sample_rate: Option<u32>,
     output_max_channels: Option<u8>,
     dacp_discovery: bool,
+    audio_latency: u32,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
     #[cfg(feature = "ap2")]
@@ -114,6 +115,7 @@ impl RaopServerBuilder {
             output_sample_rate: None,
             output_max_channels: None,
             dacp_discovery: true,
+            audio_latency: 0,
             ap1_codecs: None,
             ap1_encryption: None,
             #[cfg(feature = "ap2")]
@@ -165,6 +167,13 @@ impl RaopServerBuilder {
         self.bind = config;
         self
     }
+    /// Set the `Audio-Latency` reported in the AP1 RECORD response, in frames
+    /// at the stream rate (44100 Hz for classic AirPlay). Default: `0`.
+    pub fn audio_latency(mut self, frames: u32) -> Self {
+        self.audio_latency = frames;
+        self
+    }
+
     /// Enable the built-in DACP discovery (default: `true`).
     ///
     /// When enabled, an AP1 SETUP carrying `DACP-ID`/`Active-Remote` starts a
@@ -356,6 +365,7 @@ impl RaopServerBuilder {
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
             dacp_discovery: self.dacp_discovery,
+            audio_latency: self.audio_latency,
             #[cfg(feature = "ap2")]
             pin: self.pin,
             #[cfg(feature = "video")]

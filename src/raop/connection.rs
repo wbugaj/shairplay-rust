@@ -30,6 +30,8 @@ pub(crate) struct RaopShared {
     pub(crate) output_sample_rate: Option<u32>,
     /// Run the built-in DACP mDNS discovery and call `on_remote_control`.
     pub(crate) dacp_discovery: bool,
+    /// `Audio-Latency` reported in the AP1 RECORD response (frames).
+    pub(crate) audio_latency: u32,
     /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
     #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
     pub(crate) output_max_channels: Option<u8>,
