@@ -456,33 +456,44 @@ impl RaopBuffer {
     /// A silence substitute for a lost frame gets the timestamp that frame
     /// would have had (previous timestamp + previous frame length).
     pub fn dequeue_timed(&mut self, no_resend: bool) -> Option<(&[f32], FrameTiming)> {
-        let buflen = seqnum_cmp(self.last_seqnum, self.first_seqnum) as i32 + 1;
-        if self.is_empty || buflen <= 0 {
-            return None;
-        }
+        let (idx, seq, silence, rtp_ts) = loop {
+            let buflen = seqnum_cmp(self.last_seqnum, self.first_seqnum) as i32 + 1;
+            if self.is_empty || buflen <= 0 {
+                return None;
+            }
 
-        let idx = self.first_seqnum as usize % RAOP_BUFFER_LENGTH;
-        // Wait for retransmit unless buffer is full or retransmits are disabled.
-        if !no_resend && !self.entries[idx].available && (buflen as usize) < RAOP_BUFFER_LENGTH {
-            return None;
-        }
+            let idx = self.first_seqnum as usize % RAOP_BUFFER_LENGTH;
+            // Wait for retransmit unless buffer is full or retransmits are disabled.
+            if !no_resend && !self.entries[idx].available && (buflen as usize) < RAOP_BUFFER_LENGTH
+            {
+                return None;
+            }
 
-        let seq = self.first_seqnum;
-        self.first_seqnum = self.first_seqnum.wrapping_add(1);
+            let seq = self.first_seqnum;
+            self.first_seqnum = self.first_seqnum.wrapping_add(1);
+
+            if self.entries[idx].available {
+                break (idx, seq, false, self.entries[idx].timestamp);
+            }
+            // Lost frame: its timestamp follows the previous frame, or — right
+            // after a flush, before any real frame — precedes the next one.
+            // With no reference at all, a silence frame at an unknown time is
+            // worse than none: drop it and look at the next one.
+            if let Some(ts) = self
+                .next_timestamp
+                .or_else(|| self.timestamp_from_later_frame(seq))
+            {
+                break (idx, seq, true, ts);
+            }
+        };
 
         // Substitute silence for missing frames.
-        let silence = !self.entries[idx].available;
         if silence {
             let size = self.silence_samples.min(self.frame_capacity);
             self.entries[idx].audio_buffer[..size].fill(0.0);
             self.entries[idx].audio_buffer_len = size;
         }
         let len = self.entries[idx].audio_buffer_len;
-        let rtp_ts = if silence {
-            self.next_timestamp.unwrap_or(0)
-        } else {
-            self.entries[idx].timestamp
-        };
         let channels = usize::from(self.format().num_channels.max(1));
         self.next_timestamp = Some(rtp_ts.wrapping_add((len / channels) as u32));
 
@@ -494,6 +505,19 @@ impl RaopBuffer {
             silence,
         };
         Some((&self.entries[idx].audio_buffer[..len], timing))
+    }
+
+    /// Timestamp for missing frame `seq`, extrapolated back from the first
+    /// buffered frame after it (assumes the constant silence-frame length).
+    fn timestamp_from_later_frame(&self, seq: u16) -> Option<u32> {
+        let channels = usize::from(self.format().num_channels.max(1));
+        let frames = (self.silence_samples.min(self.frame_capacity) / channels) as u32;
+        (1..RAOP_BUFFER_LENGTH as u16).find_map(|k| {
+            let later = seq.wrapping_add(k);
+            let entry = &self.entries[later as usize % RAOP_BUFFER_LENGTH];
+            (entry.available && entry.seqnum == later)
+                .then(|| entry.timestamp.wrapping_sub(u32::from(k) * frames))
+        })
     }
 
     /// Flush the buffer, discarding all queued frames.

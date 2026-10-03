@@ -906,3 +906,21 @@ fn rtp_buffer_lost_packet_gets_extrapolated_timestamp() {
     assert_eq!((t2.seq, t2.rtp_ts), (2, 5352));
     assert_eq!((t3.rtp_ts, t3.silence), (5704, false));
 }
+
+#[test]
+fn rtp_buffer_lost_packets_right_after_flush_take_timing_from_later_frame() {
+    // Seen with iOS 26: FLUSH(seq=100), then packets 100 and 101 are lost.
+    // Their silence must not get timestamp 0 (it broke the playout timeline).
+    let mut buf = RaopBuffer::new_unencrypted("96 L16/44100/2", "").expect("L16");
+    // iOS sends a packet or two before FLUSH, so the window is already open.
+    buf.queue(&l16_packet(50, 7, 352), true);
+    buf.flush(100);
+    buf.queue(&l16_packet(102, 2_327_491_832, 352), true);
+    let (_, t100) = buf.dequeue_timed(true).unwrap();
+    assert_eq!((t100.seq, t100.silence), (100, true));
+    assert_eq!(t100.rtp_ts, 2_327_491_832 - 2 * 352);
+    let (_, t101) = buf.dequeue_timed(true).unwrap();
+    assert_eq!(t101.rtp_ts, 2_327_491_832 - 352);
+    let (_, t102) = buf.dequeue_timed(true).unwrap();
+    assert_eq!((t102.rtp_ts, t102.silence), (2_327_491_832, false));
+}
