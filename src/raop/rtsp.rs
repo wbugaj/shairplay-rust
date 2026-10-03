@@ -388,6 +388,24 @@ fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     }
 }
 
+/// TEARDOWN: stop RTP, stop buffered audio, close connection.
+fn handle_teardown(
+    conn: &mut RaopConnection,
+    _request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    response.add_header("Connection", "close");
+    response.set_disconnect(true);
+    if let Some(mut rtp) = conn.raop_rtp.take() {
+        rtp.stop();
+    }
+    #[cfg(feature = "ap2")]
+    if let Some(cmd) = &conn.playout_cmd {
+        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+    }
+    None
+}
+
 #[cfg(test)]
 mod rtp_info_tests {
     use super::{RtpInfo, parse_rtp_info};
@@ -421,22 +439,4 @@ mod rtp_info_tests {
         assert_eq!(parse_rtp_info("nonsense"), RtpInfo::default());
         assert_eq!(parse_rtp_info(""), RtpInfo::default());
     }
-}
-
-/// TEARDOWN: stop RTP, stop buffered audio, close connection.
-fn handle_teardown(
-    conn: &mut RaopConnection,
-    _request: &HttpRequest,
-    response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    response.add_header("Connection", "close");
-    response.set_disconnect(true);
-    if let Some(mut rtp) = conn.raop_rtp.take() {
-        rtp.stop();
-    }
-    #[cfg(feature = "ap2")]
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
-    }
-    None
 }
