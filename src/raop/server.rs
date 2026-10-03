@@ -6,7 +6,7 @@ use super::types::*;
 use crate::crypto::pairing::Pairing;
 use crate::crypto::rsa::RsaKey;
 use crate::error::{ServerError, ShairplayError};
-use crate::net::mdns::{AirPlayServiceInfo, MdnsService};
+use crate::net::mdns::{AirPlayServiceInfo, MdnsInterface, MdnsInterfaceFilter, MdnsService};
 #[cfg(feature = "diagnostic-headers")]
 use crate::net::protocol_diagnostics::HeaderDiagnostics;
 use crate::net::server::{BindConfig, HttpServer};
@@ -79,6 +79,7 @@ pub struct RaopServerBuilder {
     output_max_channels: Option<u8>,
     dacp_discovery: bool,
     audio_latency: u32,
+    mdns_interfaces: MdnsInterfaceFilter,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
     #[cfg(feature = "ap2")]
@@ -116,6 +117,7 @@ impl RaopServerBuilder {
             output_max_channels: None,
             dacp_discovery: true,
             audio_latency: 0,
+            mdns_interfaces: MdnsInterfaceFilter::default(),
             ap1_codecs: None,
             ap1_encryption: None,
             #[cfg(feature = "ap2")]
@@ -167,6 +169,28 @@ impl RaopServerBuilder {
         self.bind = config;
         self
     }
+    /// Advertise mDNS only on these interfaces (default: all).
+    ///
+    /// Useful on hosts with VPN or virtual adapters whose addresses the
+    /// sender cannot reach. Not supported by the macOS (Bonjour) backend.
+    pub fn mdns_allow_interfaces(
+        mut self,
+        interfaces: impl IntoIterator<Item = MdnsInterface>,
+    ) -> Self {
+        self.mdns_interfaces.allow = interfaces.into_iter().collect();
+        self
+    }
+
+    /// Never advertise mDNS on these interfaces. Applied after the allow list.
+    /// Not supported by the macOS (Bonjour) backend.
+    pub fn mdns_deny_interfaces(
+        mut self,
+        interfaces: impl IntoIterator<Item = MdnsInterface>,
+    ) -> Self {
+        self.mdns_interfaces.deny = interfaces.into_iter().collect();
+        self
+    }
+
     /// Set the `Audio-Latency` reported in the AP1 RECORD response, in frames
     /// at the stream rate (44100 Hz for classic AirPlay). Default: `0`.
     pub fn audio_latency(mut self, frames: u32) -> Self {
@@ -399,6 +423,7 @@ impl RaopServerBuilder {
             name: self.name,
             hwaddr,
             ap1_advertisement,
+            mdns_interfaces: self.mdns_interfaces,
             #[cfg(feature = "ap2")]
             mode: self.mode,
         })
@@ -414,6 +439,7 @@ pub struct RaopServer {
     shared: Arc<RaopShared>,
     httpd: HttpServer,
     mdns: Option<MdnsService>,
+    mdns_interfaces: MdnsInterfaceFilter,
     bind: BindConfig,
     name: String,
     hwaddr: Vec<u8>,
@@ -444,7 +470,7 @@ impl RaopServer {
 
         if std::env::var("CI").is_err() {
             let info = self.service_info();
-            let mut mdns = MdnsService::new()?;
+            let mut mdns = MdnsService::new(&self.mdns_interfaces)?;
             mdns.register_raop(&info)?;
             #[cfg(feature = "ap2")]
             if self.mode == AirPlayMode::AirPlay2 {

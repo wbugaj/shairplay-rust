@@ -7,6 +7,41 @@ use crate::error::NetworkError;
 use crate::raop::config::Ap1Advertisement;
 use crate::util;
 
+/// Selects a network interface for mDNS advertisement.
+///
+/// Honoured by the `mdns-sd` backend (non-macOS). Hosts with virtual adapters
+/// (VPN, Hyper-V, WSL) otherwise advertise addresses senders cannot reach.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MdnsInterface {
+    /// Interface name as reported by the OS (e.g. `"Wi-Fi"`, `"eth0"`).
+    Name(String),
+    /// The interface that owns this address.
+    Addr(std::net::IpAddr),
+}
+
+/// Allow/deny lists for mDNS interfaces. Empty = all interfaces (default).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MdnsInterfaceFilter {
+    pub(crate) allow: Vec<MdnsInterface>,
+    pub(crate) deny: Vec<MdnsInterface>,
+}
+
+impl MdnsInterfaceFilter {
+    /// Ordered `(enabled, interface)` rules; `None` means "all interfaces".
+    /// `mdns-sd` applies rules in order with the last match winning, so an
+    /// allow list first disables everything, and deny rules come last.
+    pub(crate) fn rules(&self) -> Vec<(bool, Option<&MdnsInterface>)> {
+        let mut rules = Vec::new();
+        if !self.allow.is_empty() {
+            rules.push((false, None));
+            rules.extend(self.allow.iter().map(|i| (true, Some(i))));
+        }
+        rules.extend(self.deny.iter().map(|i| (false, Some(i))));
+        rules
+    }
+}
+
 // --- AP1 mDNS TXT record constants ---
 
 /// TXT record version.
@@ -228,8 +263,9 @@ pub(crate) struct MdnsService {
 
 #[cfg(target_os = "macos")]
 impl MdnsService {
-    /// Create a new mDNS service manager.
-    pub(crate) fn new() -> Result<Self, NetworkError> {
+    /// Create a new mDNS service manager. Bonjour picks interfaces itself;
+    /// the interface filter is not supported on macOS.
+    pub(crate) fn new(_filter: &MdnsInterfaceFilter) -> Result<Self, NetworkError> {
         Ok(Self {
             _raop_reg: None,
             _airplay_reg: None,
@@ -295,9 +331,22 @@ pub(crate) struct MdnsService {
 #[cfg(not(target_os = "macos"))]
 impl MdnsService {
     /// Create a new mDNS service manager.
-    pub(crate) fn new() -> Result<Self, NetworkError> {
+    pub(crate) fn new(filter: &MdnsInterfaceFilter) -> Result<Self, NetworkError> {
         let daemon =
             mdns_sd::ServiceDaemon::new().map_err(|e| NetworkError::Mdns(format!("{e}")))?;
+        for (enabled, intf) in filter.rules() {
+            let kind = match intf {
+                None => mdns_sd::IfKind::All,
+                Some(MdnsInterface::Name(name)) => mdns_sd::IfKind::Name(name.clone()),
+                Some(MdnsInterface::Addr(addr)) => mdns_sd::IfKind::Addr(*addr),
+            };
+            let result = if enabled {
+                daemon.enable_interface(kind)
+            } else {
+                daemon.disable_interface(kind)
+            };
+            result.map_err(|e| NetworkError::Mdns(format!("{e}")))?;
+        }
         Ok(Self {
             daemon,
             raop_fullname: None,
@@ -519,5 +568,39 @@ mod tests {
         assert_eq!(airplay("features"), Some("0x527FFEE6,0x0"));
         assert_eq!(raop("sf"), Some("0x204"));
         assert_eq!(airplay("flags"), Some("0x204"));
+    }
+}
+
+#[cfg(test)]
+mod interface_filter_tests {
+    use super::{MdnsInterface, MdnsInterfaceFilter};
+
+    #[test]
+    fn empty_filter_has_no_rules() {
+        assert!(MdnsInterfaceFilter::default().rules().is_empty());
+    }
+
+    #[test]
+    fn allow_list_disables_all_first_and_deny_comes_last() {
+        let wifi = MdnsInterface::Name("Wi-Fi".into());
+        let vpn = MdnsInterface::Addr("26.200.16.144".parse().unwrap());
+        let filter = MdnsInterfaceFilter {
+            allow: vec![wifi.clone()],
+            deny: vec![vpn.clone()],
+        };
+        assert_eq!(
+            filter.rules(),
+            vec![(false, None), (true, Some(&wifi)), (false, Some(&vpn))]
+        );
+    }
+
+    #[test]
+    fn deny_only_keeps_everything_else() {
+        let vpn = MdnsInterface::Name("Radmin VPN".into());
+        let filter = MdnsInterfaceFilter {
+            allow: vec![],
+            deny: vec![vpn.clone()],
+        };
+        assert_eq!(filter.rules(), vec![(false, Some(&vpn))]);
     }
 }
